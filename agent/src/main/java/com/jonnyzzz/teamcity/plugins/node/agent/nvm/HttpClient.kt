@@ -17,33 +17,42 @@
 package com.jonnyzzz.teamcity.plugins.node.agent.nvm
 
 import com.jonnyzzz.teamcity.plugins.node.common.log4j
-import jetbrains.buildServer.version.ServerVersionHolder
-import org.apache.http.HttpResponse
-import org.apache.http.client.HttpClient
-import org.apache.http.client.methods.HttpUriRequest
-import org.apache.http.conn.ssl.SSLSocketFactory
-import org.apache.http.conn.ssl.TrustStrategy
-import org.apache.http.impl.client.DefaultHttpClient
-import org.apache.http.impl.conn.SchemeRegistryFactory
-import org.apache.http.params.BasicHttpParams
-import org.apache.http.params.HttpConnectionParams
-import org.apache.http.params.HttpProtocolParams
-import java.security.cert.X509Certificate
 import jetbrains.buildServer.serverSide.TeamCityProperties
+import jetbrains.buildServer.version.ServerVersionHolder
+import org.apache.http.HttpException
 import org.apache.http.HttpHost
+import org.apache.http.HttpRequest
+import org.apache.http.HttpResponse
 import org.apache.http.auth.AuthScope
+import org.apache.http.auth.Credentials
 import org.apache.http.auth.NTCredentials
 import org.apache.http.auth.UsernamePasswordCredentials
-import java.net.ProxySelector
-import org.apache.http.conn.scheme.Scheme
-import org.apache.http.impl.conn.ProxySelectorRoutePlanner
-import org.apache.http.client.protocol.RequestAcceptEncoding
-import org.apache.http.client.protocol.ResponseContentEncoding
-import org.apache.http.impl.conn.DefaultProxyRoutePlanner
+import org.apache.http.client.HttpClient
+import org.apache.http.client.config.RequestConfig
+import org.apache.http.client.methods.HttpUriRequest
+import org.apache.http.config.RegistryBuilder
+import org.apache.http.conn.routing.HttpRoute
+import org.apache.http.conn.socket.ConnectionSocketFactory
+import org.apache.http.conn.socket.PlainConnectionSocketFactory
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory
+import org.apache.http.conn.ssl.SSLContexts
 import org.apache.http.conn.ssl.X509HostnameVerifier
+import org.apache.http.impl.client.BasicCredentialsProvider
 import org.apache.http.impl.client.DefaultHttpRequestRetryHandler
-import org.apache.http.impl.conn.PoolingClientConnectionManager
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.impl.conn.DefaultProxyRoutePlanner
+import org.apache.http.impl.conn.DefaultRoutePlanner
+import org.apache.http.impl.conn.DefaultSchemePortResolver
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager
+import org.apache.http.protocol.HttpContext
 import org.springframework.beans.factory.DisposableBean
+import java.io.IOException
+import java.security.KeyManagementException
+import java.security.KeyStoreException
+import java.security.NoSuchAlgorithmException
+import java.security.cert.X509Certificate
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSession
 import javax.net.ssl.SSLSocket
 
@@ -52,7 +61,7 @@ import javax.net.ssl.SSLSocket
  * Date: 13.08.13 22:43
  */
 interface HttpClientWrapper {
-  fun <T> execute(request: HttpUriRequest, action: HttpResponse.() -> T): T
+    fun <T> execute(request: HttpUriRequest, action: HttpResponse.() -> T): T
 }
 
 /**
@@ -60,103 +69,125 @@ interface HttpClientWrapper {
  * Date: 11.08.11 16:24
  */
 class HttpClientWrapperImpl : HttpClientWrapper, DisposableBean {
-  private val LOG = log4j(NVMDownloader::class.java)
+    private val logger = log4j(NVMDownloader::class.java)
 
-  private val myClient: HttpClient;
-  init {
-    val serverVersion = ServerVersionHolder.getVersion().displayVersion;
-    val ps = BasicHttpParams();
+    private val myClient: HttpClient
+    private var myConnectionManager: PoolingHttpClientConnectionManager? = null
 
-    DefaultHttpClient.setDefaultHttpParams(ps);
-    HttpConnectionParams.setConnectionTimeout(ps, 300 * 1000);
-    HttpConnectionParams.setSoTimeout(ps, 300 * 1000);
-    HttpProtocolParams.setUserAgent(ps, "JetBrains TeamCity " + serverVersion);
-
-    val cm =
-            if (!TeamCityProperties.getBoolean("teamcity.node.verify.ssl.certificate")) {
-              val schemaRegistry = SchemeRegistryFactory.createDefault()
-              val sslSocketFactory = SSLSocketFactory(
-                      object : TrustStrategy {
-                        override fun isTrusted(chain: Array<out X509Certificate>?, authType: String?): Boolean {
-                          return true;
-                        }
-                      }, object : X509HostnameVerifier {
-                        override fun verify(host: String?, ssl: SSLSocket?) {}
-                        override fun verify(host: String?, cert: X509Certificate?) { }
-                        override fun verify(host: String?, cns: Array<out String>?, subjectAlts: Array<out String>?) { }
-                        override fun verify(p0: String?, p1: SSLSession?): Boolean = true
-                      })
-
-              schemaRegistry.register(Scheme("https", 443, sslSocketFactory));
-              PoolingClientConnectionManager(schemaRegistry)
-            } else {
-              PoolingClientConnectionManager()
+    init {
+        val serverVersion = ServerVersionHolder.getVersion().displayVersion
+        val myRegistries = RegistryBuilder
+                .create<ConnectionSocketFactory>().register("http", PlainConnectionSocketFactory.INSTANCE)
+        if (!TeamCityProperties.getBoolean("teamcity.node.verify.ssl.certificate")) {
+            val builder = SSLContexts.custom()
+            try {
+                builder.loadTrustMaterial(null) { chain, authType -> true }
+            } catch (e: NoSuchAlgorithmException) {
+                e.printStackTrace()
+            } catch (e: KeyStoreException) {
+                e.printStackTrace()
             }
 
-    val httpclient = DefaultHttpClient(cm, ps);
+            var sslContext: SSLContext? = null
+            try {
+                sslContext = builder.build()
+            } catch (e: NoSuchAlgorithmException) {
+                e.printStackTrace()
+            } catch (e: KeyManagementException) {
+                e.printStackTrace()
+            }
 
-    httpclient.routePlanner = ProxySelectorRoutePlanner(
-            httpclient.connectionManager!!.schemeRegistry,
-            ProxySelector.getDefault());
+            val sslConnectionSocketFactory = SSLConnectionSocketFactory(
+                    sslContext!!, object : X509HostnameVerifier {
+                @Throws(IOException::class)
+                override fun verify(host: String, ssl: SSLSocket) {
+                }
 
+                @Throws(SSLException::class)
+                override fun verify(host: String, cert: X509Certificate) {
+                }
 
-    httpclient.addRequestInterceptor(RequestAcceptEncoding());
-    httpclient.addResponseInterceptor(ResponseContentEncoding());
-    httpclient.httpRequestRetryHandler = DefaultHttpRequestRetryHandler(3, true);
+                @Throws(SSLException::class)
+                override fun verify(host: String, cns: Array<String>,
+                                    subjectAlts: Array<String>) {
+                }
 
-    val PREFIX = "teamcity.http.proxy.";
-    val SUFFIX = ".node";
+                override fun verify(s: String, sslSession: SSLSession): Boolean {
+                    return true
+                }
+            })
 
-    val proxyHost = TeamCityProperties.getPropertyOrNull(PREFIX + "host" + SUFFIX)
-    val proxyPort = TeamCityProperties.getInteger(PREFIX + "port" + SUFFIX, 3128)
-
-    val proxyDomain = TeamCityProperties.getPropertyOrNull(PREFIX + "domain" + SUFFIX)
-    val proxyUser = TeamCityProperties.getPropertyOrNull(PREFIX + "user" + SUFFIX)
-    val proxyPassword = TeamCityProperties.getPropertyOrNull(PREFIX + "password" + SUFFIX)
-    val proxyWorkstation = TeamCityProperties.getPropertyOrNull(PREFIX + "workstation" + SUFFIX)
-
-    if (proxyHost != null && proxyPort > 0) {
-      val proxy = HttpHost(proxyHost, proxyPort);
-
-      httpclient.routePlanner = DefaultProxyRoutePlanner(proxy)
-      
-      if (proxyUser != null && proxyPassword != null) {
-        if (proxyDomain != null || proxyWorkstation != null) {
-          LOG.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort, username: ${proxyDomain ?: proxyWorkstation ?: "."}\\$proxyUser")
-
-          httpclient.credentialsProvider.setCredentials(
-                  AuthScope(proxyHost, proxyPort),
-                  NTCredentials(proxyUser,
-                          proxyPassword,
-                          proxyWorkstation,
-                          proxyDomain))
+            myConnectionManager = PoolingHttpClientConnectionManager(myRegistries.register("https", sslConnectionSocketFactory)
+                    .build())
         } else {
-          LOG.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort, username: $proxyUser")
-          httpclient.credentialsProvider.setCredentials(
-                  AuthScope(proxyHost, proxyPort),
-                  UsernamePasswordCredentials(proxyUser,
-                          proxyPassword))
+            myConnectionManager = PoolingHttpClientConnectionManager()
         }
-      } else {
-        LOG.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort")
-      }
+
+        val routePlanner = object : DefaultRoutePlanner(DefaultSchemePortResolver.INSTANCE) {
+            @Throws(HttpException::class)
+            override fun determineRoute(host: HttpHost, request: HttpRequest, context: HttpContext): HttpRoute {
+                return super.determineRoute(host, request, context)
+            }
+        }
+
+        val hcBuilder = HttpClients.custom()
+                .setConnectionManager(myConnectionManager)
+                .setRoutePlanner(routePlanner)
+                .setUserAgent("JetBrains TeamCity $serverVersion")
+                .setDefaultRequestConfig(
+                        RequestConfig.custom()
+                                .setSocketTimeout(300 * 1000)
+                                .setConnectTimeout(300 * 1000)
+                                .setConnectionRequestTimeout(5000)
+                                .build())
+                .setRetryHandler(DefaultHttpRequestRetryHandler(3, true))
+
+        hcBuilder.setRoutePlanner(routePlanner)
+
+        val prefix = "teamcity.http.proxy."
+        val suffix = ".node"
+
+        val proxyHost = TeamCityProperties.getPropertyOrNull(prefix + "host" + suffix)
+        val proxyPort = TeamCityProperties.getInteger(prefix + "port" + suffix, 3128)
+
+        val proxyDomain = TeamCityProperties.getPropertyOrNull(prefix + "domain" + suffix)
+        val proxyUser = TeamCityProperties.getPropertyOrNull(prefix + "user" + suffix)
+        val proxyPassword = TeamCityProperties.getPropertyOrNull(prefix + "password" + suffix)
+        val proxyWorkstation = TeamCityProperties.getPropertyOrNull(prefix + "workstation" + suffix)
+
+        if (proxyHost != null && proxyPort > 0) {
+            hcBuilder.setRoutePlanner(DefaultProxyRoutePlanner(HttpHost(proxyHost, proxyPort)))
+
+            if (proxyUser != null && proxyPassword != null) {
+                val credentialsProvider = BasicCredentialsProvider()
+                if (proxyDomain != null || proxyWorkstation != null) {
+                    logger.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort, username: ${proxyDomain
+                            ?: proxyWorkstation ?: "."}\\$proxyUser")
+                    credentialsProvider.setCredentials(AuthScope(proxyHost, proxyPort), UsernamePasswordCredentials(proxyUser, proxyPassword) as Credentials)
+                } else {
+                    logger.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort, username: $proxyUser")
+                    credentialsProvider.setCredentials(AuthScope(proxyHost, proxyPort), NTCredentials(proxyUser, proxyPassword, proxyWorkstation, proxyDomain) as Credentials)
+                }
+            } else {
+                logger.info("TeamCity.Node.NVM. Using HTTP proxy $proxyHost:$proxyPort")
+            }
+        }
+
+        myClient = hcBuilder.build()
     }
 
-    myClient = httpclient;
-  }
-
-  override fun <T> execute(request: HttpUriRequest, action: HttpResponse.() -> T): T {
-    val response = myClient.execute(request)!!
-    try {
-      return response.action()
-    } finally {
-      request.abort()
+    override fun <T> execute(request: HttpUriRequest, action: HttpResponse.() -> T): T {
+        val response = myClient.execute(request)!!
+        try {
+            return response.action()
+        } finally {
+            request.abort()
+        }
     }
-  }
 
 
-  override fun destroy() {
-    myClient.connectionManager!!.shutdown();
-  }
+    override fun destroy() {
+        myConnectionManager!!.shutdown()
+    }
 }
 
